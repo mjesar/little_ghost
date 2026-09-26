@@ -126,6 +126,33 @@ class GeminiTest < Minitest::Test
     refute_includes transport.arguments.fetch(:path), "key="
   end
 
+  def test_sends_the_original_function_name_back_with_a_tool_result
+    signed_call = {functionCall: {id: "tool-1", name: "lookup", args: {id: 1}}}
+    transport = SequencedTransport.new(
+      [{modelVersion: "gemini", candidates: [{content: {parts: [signed_call]}, finishReason: "STOP"}]}],
+      [{candidates: [{content: {parts: [{text: "done"}]}, finishReason: "STOP"}]}]
+    )
+    provider = LittleGhost::Providers::Gemini.new(api_key: "secret", model: "gemini", transport:)
+
+    tool_use = call_tool(provider)
+    follow_up_with(provider, tool_use)
+
+    assert_equal "lookup", function_response_part(transport, index: 1).dig("functionResponse", "name")
+  end
+
+  def test_falls_back_to_the_tool_use_id_for_a_result_the_provider_never_saw_a_call_for
+    transport = Transport.new
+    provider = LittleGhost::Providers::Gemini.new(api_key: "secret", model: "gemini", transport:)
+    result = LittleGhost::Content::ToolResult.new(tool_use_id: "unseen-call", content: "42", status: :success)
+    request = LittleGhost::ModelRequest.new(messages: [LittleGhost::Message.new(role: :tool, content: [result])])
+
+    provider.stream(request).to_a
+
+    function_response = JSON.parse(transport.arguments.fetch(:body)).fetch("contents")
+      .flat_map { |message| message.fetch("parts") }.find { |part| part["functionResponse"] }
+    assert_equal "unseen-call", function_response.dig("functionResponse", "name")
+  end
+
   private
 
   def call_tool(provider)
@@ -147,5 +174,10 @@ class GeminiTest < Minitest::Test
   def function_call_part(transport, index:)
     JSON.parse(transport.requests.fetch(index).fetch(:body)).fetch("contents")
       .flat_map { |message| message.fetch("parts") }.find { |part| part["functionCall"] }
+  end
+
+  def function_response_part(transport, index:)
+    JSON.parse(transport.requests.fetch(index).fetch(:body)).fetch("contents")
+      .flat_map { |message| message.fetch("parts") }.find { |part| part["functionResponse"] }
   end
 end

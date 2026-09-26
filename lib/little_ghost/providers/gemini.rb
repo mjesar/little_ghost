@@ -23,6 +23,11 @@ module LittleGhost
     # +functionCall+. The adapter caches each signature by tool-call id for the
     # life of this instance and replays it automatically; application code
     # never sees or handles thought signatures directly.
+    #
+    # A ToolResult only carries the tool-call id it answers, not the original
+    # function name Gemini requires in +functionResponse.name+. The adapter
+    # remembers each tool call's name by id for the life of this instance and
+    # fills it in automatically when the matching result is sent back.
     class Gemini < Base
       # Request policy supported by Gemini and Vertex AI HTTP clients.
       def self.request_options = %i[max_response_bytes open_timeout read_timeout].freeze
@@ -41,6 +46,7 @@ module LittleGhost
         @model = model
         @transport = transport || Support::HTTPClient.new(base_url:, open_timeout:, read_timeout:, max_response_bytes:)
         @thought_signatures = {}
+        @tool_names = {}
       end
 
       # Streams normalized events for +request+.
@@ -48,7 +54,7 @@ module LittleGhost
         return enum_for(__method__, request) unless block_given?
 
         parser = Support::SSEParser.new
-        normalizer = Normalizer.new(model:, thought_signatures: @thought_signatures)
+        normalizer = Normalizer.new(model:, thought_signatures: @thought_signatures, tool_names: @tool_names)
         @transport.stream(
           path: endpoint,
           headers: request_headers(request),
@@ -110,7 +116,8 @@ module LittleGhost
           {inlineData: {mimeType: block.media_type, data: Base64.strict_encode64(block.data)}}
         when Content::ToolUse then google_tool_use(block)
         when Content::ToolResult
-          {functionResponse: {id: block.tool_use_id, name: block.tool_use_id, response: {output: Array(block.content).join("\n")}}}
+          name = @tool_names[block.tool_use_id] || block.tool_use_id
+          {functionResponse: {id: block.tool_use_id, name:, response: {output: Array(block.content).join("\n")}}}
         when Content::Reasoning then {text: block.text, thought: true}
         else raise ConfigurationError, "Unsupported Google content block: #{block.class}"
         end
@@ -134,9 +141,10 @@ module LittleGhost
       end
 
       class Normalizer # :nodoc:
-        def initialize(model:, thought_signatures:)
+        def initialize(model:, thought_signatures:, tool_names:)
           @model = model
           @thought_signatures = thought_signatures
+          @tool_names = tool_names
           @text = +""
           @reasoning = +""
           @tools = []
@@ -189,6 +197,7 @@ module LittleGhost
             tool = Content::ToolUse.new(id: call["id"] || "call-#{index}", name: call.fetch("name"), input: call["args"] || {})
             @tools << tool
             @thought_signatures[tool.id] = part["thoughtSignature"] if part["thoughtSignature"]
+            @tool_names[tool.id] = tool.name
             [
               StreamEvent.build(:tool_call_start, index:, id: tool.id, name: tool.name),
               StreamEvent.build(:tool_call_stop, index:, tool_use: tool)
